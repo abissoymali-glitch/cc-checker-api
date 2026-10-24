@@ -1,0 +1,10 @@
+{
+  "name": "cc-checker-api",
+  "version": "1.0.0",
+  "description": "CC Checker API",
+  "main": "api/index.js",
+  "dependencies": {
+    "axios": "^1.6.8",
+    "formidable": "^3.5.1"
+  }
+}
